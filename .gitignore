@@ -1,0 +1,30 @@
+```gitignore
+# Python virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+**/.streamlit/secrets.toml
+```
+# Git and generated files
+.DS_Store
+Thumbs.db
+*.log
+
+# Build and test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.streamlit/cache/
+
+# Temporary files
+*.tmp
+*.bak
