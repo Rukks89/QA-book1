@@ -1,12 +1,15 @@
 streamlit>=1.40
 pandas>=2.2
 openpyxl>=3.1
-pytesseract>=0.3.13
-opencv-python-headless>=5.0.0
-Pillow>=12.3.0
+numpy>=1.26,<3
+Pillow>=10.0
 pillow-heif>=0.18.0
-numpy>=2.0,<3
-
-
-
-
+opencv-python-headless>=4.10
+# --- OCR engines ---
+# Deep-learning OCR (PP-OCR models bundled, runs on CPU) - main engine
+rapidocr>=3.4,<4
+onnxruntime>=1.18
+# Barcode symbol decoder (label barcode = chassis number)
+zxing-cpp>=2.2
+# Fallback OCR engine (needs tesseract-ocr from packages.txt)
+pytesseract>=0.3.13

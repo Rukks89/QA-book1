@@ -1,7 +1,8 @@
 # TMBSL QA Book Scanning & Batch Tracking System
 
 ## Purpose
-Barcode-based digitization of QA Book records. No OCR is used.
+Digitization of QA Book records by USB barcode scanner, manual entry,
+or **AI OCR of a label photo** (phone camera or upload).
 
 ## Workflow
 1. Create a batch (default 30 books).
@@ -63,3 +64,46 @@ This is a prototype. Before production deployment, confirm the exact TMBSL busin
 - batch identification
 - master-data source
 - barcode format
+
+
+## OCR (label photo) — v2, high accuracy
+
+The OCR reads **Chassis No, BC No, TMBSL VC No, Color, Order, Seating**
+from a photo of the QA Book label.
+
+How it gets high accuracy:
+
+| Layer | What it does |
+|---|---|
+| RapidOCR (PP-OCR deep-learning models, CPU/ONNX) | Main OCR engine — far better than Tesseract on phone photos |
+| Barcode decode (zxing-cpp + built-in Code 39 decoder) | The label barcode encodes the chassis number; it is read from many scan-lines and, when they agree, the chassis is taken from the barcode (no T/1, O/0, S/5 mix-ups possible) |
+| Character-by-character vote | The Chassis/VC line is re-read from ~15 enhanced crops; each of the 17 chassis characters is voted separately and any unclear character is reported ("character 11: 'M' or 'N'") |
+| Field templates | Chassis `MAT`+6 digits+3 chars+5 digits, VC No 11 digits + `R`; fixes O/0, I/1, S/5, B/8 only where a digit must be |
+| Vocabulary snap | Color (WHITE, OTHERS, …) and Order (MTS, EVR) fixed for small misreads (e.g. OTHEAS → OTHERS) |
+| Master / mapping snap | A chassis 1–2 characters off a known chassis (master data or uploaded Bus–Chassis file) is matched to it |
+| Auto-orientation | Sideways / upside-down / tilted photos are handled automatically |
+| Confidence flags | Each field shows ✅ confident, ⚠️ please check, or ❌ not found |
+
+Benchmark on real TMBSL label photos + 30 degraded variants (blur, tilt,
+90°/180° rotation, glare, darkness, noise, JPEG artefacts, perspective,
+distance): **old engine 53% of fields correct → new engine 98%**, about
+1–2 s per photo. The few misses were physically unreadable (text cut off
+or washed out by glare) and were all flagged ⚠️/❌ rather than silently wrong.
+
+Tips for best results:
+- On a phone, use **Upload Photo → Camera** (full resolution + autofocus).
+- Fill the frame with the label; avoid strong glare across the text.
+
+Run the OCR tests:
+
+    python -m unittest tests.test_ocr_accuracy -v
+
+## Deploying on Streamlit Community Cloud
+
+1. Push this folder to the GitHub repo used by the app (`app.py` at the repo root,
+   with `requirements.txt` and `packages.txt` next to it).
+2. Streamlit Cloud reinstalls dependencies automatically (first boot after
+   the change takes ~3–5 min). If it doesn't, use **Manage app → Reboot app**.
+3. Python 3.11–3.13 is recommended (Advanced settings).
+4. The app header shows the OCR engine in use under the extracted fields
+   ("RapidOCR (deep learning) + Tesseract").

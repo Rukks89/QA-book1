@@ -1973,3 +1973,29 @@ def delete_batch(batch_id):
     finally:
 
         conn.close()
+
+# ============================================================
+# KNOWN CHASSIS NUMBERS (for OCR snapping / verification)
+# ============================================================
+
+def get_known_chassis_numbers():
+    """
+    Return the distinct chassis numbers from approved master data.
+    OCR uses them to confirm a reading, or to correct a reading that
+    is only 1-2 characters away from exactly one real chassis.
+    """
+
+    try:
+        conn = connect()
+        rows = conn.execute(
+            """
+            SELECT DISTINCT chassis_no
+            FROM master_specs
+            WHERE chassis_no IS NOT NULL AND TRIM(chassis_no) <> ''
+            """
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    return [str(row[0]).strip() for row in rows if row and row[0]]

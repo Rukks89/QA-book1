@@ -23,6 +23,8 @@ from core.database import (
     update_record_fields,
     delete_record,
     save_batch_atomically,
+    get_known_chassis_numbers,
+    create_batch,
 )
 
 from core.report_generator import generate_excel
@@ -38,6 +40,8 @@ try:
         extract_label_fields,
         estimate_image_quality,
         HEIF_AVAILABLE,
+        ocr_engine_name,
+        warm_up as _ocr_warm_up,
     )
 
     OCR_AVAILABLE = True
@@ -66,6 +70,65 @@ st.set_page_config(
 # ============================================================
 
 init_db()
+
+
+# ============================================================
+# OCR WARM-UP (load the deep-learning OCR models once per server,
+# so the first scan in the demo is as fast as every other scan)
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def _warm_ocr_models():
+    if not OCR_AVAILABLE:
+        return False
+    try:
+        return _ocr_warm_up()
+    except Exception:
+        return False
+
+
+_warm_ocr_models()
+
+
+def _known_chassis_for_ocr():
+    """Chassis numbers from master data + the uploaded Bus–Chassis mapping."""
+
+    known = []
+    try:
+        known.extend(get_known_chassis_numbers())
+    except Exception:
+        pass
+    try:
+        mapping = _get_mapping_df()
+        if mapping is not None and "Chassis No" in mapping.columns:
+            known.extend(
+                str(v).strip()
+                for v in mapping["Chassis No"].tolist()
+                if str(v).strip()
+            )
+    except Exception:
+        pass
+    return sorted(set(known))
+
+
+_CONFIDENCE_ICON = {"high": "✅", "check": "⚠️", "missing": "❌"}
+_FIELD_LABELS = {
+    "chassis_no": "Chassis No",
+    "barcode": "BC No (Barcode)",
+    "vc_no": "TMBSL VC No",
+    "color": "Color",
+    "order_no": "Order",
+    "seating": "Seating",
+}
+
+
+def _fields_to_check(ocr_data):
+    conf = (ocr_data or {}).get("confidence") or {}
+    return [
+        _FIELD_LABELS.get(field, field)
+        for field in _FIELD_LABELS
+        if conf.get(field, "high") != "high"
+    ]
 
 
 # ============================================================
@@ -1357,7 +1420,10 @@ def _draft_record_from_image(uploaded_image):
     else:
         try:
             quality = estimate_image_quality(image_bytes)
-            extracted = extract_label_fields(image_bytes)
+            extracted = extract_label_fields(
+                image_bytes,
+                known_chassis=_known_chassis_for_ocr(),
+            )
         except Exception as error:
             processing_error = f"Image/OCR processing failed: {error}"
 
@@ -1400,12 +1466,14 @@ def _draft_record_from_image(uploaded_image):
             if (
                 processing_error
                 or not extracted.get("barcode")
+                or extracted.get("needs_review")
                 or quality.get("is_blurry")
                 or quality.get("is_low_res")
             )
             else "READY"
         ),
         "processing_error": processing_error,
+        "ocr_check_fields": ", ".join(_fields_to_check(extracted)),
         "scan_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     return record
@@ -1830,7 +1898,11 @@ def _render_batch_draft():
             review_status = record.get("processing_error") or (
                 " ".join(quality_flags)
                 or (
-                    "Manual review required"
+                    (
+                        "Check: " + record["ocr_check_fields"]
+                        if record.get("ocr_check_fields")
+                        else "Manual review required"
+                    )
                     if record.get("verification_status") == "REVIEW"
                     else "Ready"
                 )
@@ -2169,6 +2241,11 @@ batch_options = (
     + all_batch_ids
 )
 
+# A batch that was just created is selected automatically.
+_pending_selection = st.session_state.pop("_select_batch_after_create", None)
+if _pending_selection and _pending_selection in batch_options:
+    st.session_state["batch_selection"] = _pending_selection
+
 selected = st.sidebar.selectbox(
     "Select Batch",
     batch_options,
@@ -2180,6 +2257,27 @@ has_paused_draft = bool(
     paused_draft
     and not st.session_state.get("draft_batch_active")
 )
+
+# An EMPTY paused draft (0 staged books) holds no data, so it must never
+# block the user from creating a different batch: drop it automatically
+# when "Create New Batch" is chosen.
+if (
+    has_paused_draft
+    and selected == "Create New Batch"
+    and not st.session_state.get("draft_batch_records")
+):
+    _clear_batch_draft()
+    paused_draft = None
+    has_paused_draft = False
+
+
+def _discard_paused_draft():
+    _clear_batch_draft()
+    st.session_state["_draft_generation"] = (
+        st.session_state.get("_draft_generation", 0) + 1
+    )
+
+
 if has_paused_draft:
     st.sidebar.info(
         f"Paused draft: {paused_draft['batch_id']} "
@@ -2189,6 +2287,18 @@ if has_paused_draft:
         f"Resume Draft {paused_draft['batch_id']}",
         on_click=_resume_batch_draft,
         key=f"resume_batch_draft_{st.session_state.get('_draft_generation', 0)}",
+        use_container_width=True,
+    )
+    _confirm_discard = st.sidebar.checkbox(
+        f"Discard draft {paused_draft['batch_id']} "
+        f"({len(st.session_state.get('draft_batch_records', []))} unsaved book(s))",
+        key=f"confirm_discard_paused_{st.session_state.get('_draft_generation', 0)}",
+    )
+    st.sidebar.button(
+        "🗑 Discard Paused Draft",
+        on_click=_discard_paused_draft,
+        disabled=not _confirm_discard,
+        key=f"discard_paused_draft_{st.session_state.get('_draft_generation', 0)}",
         use_container_width=True,
     )
 
@@ -2212,13 +2322,18 @@ if (
         )
 
         st.caption(
-            "Recommended format: SEP26-QA01"
+            "Type any Batch ID you want (max 20 characters). "
+            f"Suggested next ID: {suggested_batch_id}"
         )
 
         new_batch = st.text_input(
             "Batch ID",
-            value=suggested_batch_id,
-            placeholder="Example: SEP26-QA01"
+            value="",
+            placeholder=f"e.g. {suggested_batch_id}",
+            help=(
+                "Leave empty to use the suggested ID "
+                f"({suggested_batch_id})."
+            ),
         )
 
         target_books = st.number_input(
@@ -2256,7 +2371,9 @@ if (
 
         if create_submitted:
 
-            new_batch = new_batch.strip().upper()
+            new_batch = (
+                new_batch.strip().upper() or suggested_batch_id
+            )
 
             if not new_batch:
 
@@ -2275,14 +2392,27 @@ if (
                 if new_batch in all_batch_ids:
                     st.error("Batch ID already exists.")
                 else:
-                    _start_batch_draft(
+                    # Save the batch right away so it appears in
+                    # "Select Batch" immediately; books are still added
+                    # through the draft and saved on confirmation.
+                    created, create_msg = create_batch(
                         new_batch,
                         str(batch_date),
                         observations.strip(),
                         target_books,
-                        is_new=True,
                     )
-                    st.rerun()
+                    if not created:
+                        st.error(create_msg)
+                    else:
+                        _start_batch_draft(
+                            new_batch,
+                            str(batch_date),
+                            observations.strip(),
+                            target_books,
+                            is_new=False,
+                        )
+                        st.session_state["_select_batch_after_create"] = new_batch
+                        st.rerun()
 
 
     active_batch = None
@@ -2293,7 +2423,9 @@ elif selected == "Create New Batch":
     active_batch = None
     if has_paused_draft:
         st.sidebar.warning(
-            "Resume or discard the paused draft before starting another draft."
+            "This paused draft has unsaved books. Resume it, or tick "
+            "the discard box above and press 🗑 Discard Paused Draft, "
+            "then create your new batch."
         )
 
 
@@ -3270,12 +3402,13 @@ if active_batch:
                     if image_source == "Use Camera":
 
                         st.caption(
-                            "📸 For the best one-shot read: fill "
-                            "the frame with the label, wait a "
-                            "moment for the camera to focus, and "
-                            "avoid glare/shadows across the text. "
-                            "A slight camera angle is fine — it's "
-                            "corrected automatically."
+                            "📸 Fill the frame with the label, wait "
+                            "a moment for focus, and avoid glare on "
+                            "the text. Tilted / sideways / upside-down "
+                            "photos are corrected automatically. "
+                            "📱 On a phone, **Upload Photo → Camera** "
+                            "gives the sharpest image (full "
+                            "resolution + autofocus)."
                         )
 
                         image_file = st.camera_input(
@@ -3391,17 +3524,19 @@ if active_batch:
                         if is_new_image:
 
                             with st.spinner(
-                                "Extracting label data... this "
-                                "runs several accuracy passes "
-                                "and usually takes 5-15 seconds "
-                                "(harder photos may take up to 30s)."
+                                "Reading label with AI OCR... "
+                                "usually 1-3 seconds (difficult "
+                                "photos up to ~10 s)."
                             ):
 
                                 try:
 
                                     ocr_data = (
                                         extract_label_fields(
-                                            image_bytes
+                                            image_bytes,
+                                            known_chassis=(
+                                                _known_chassis_for_ocr()
+                                            ),
                                         )
                                     )
 
@@ -3540,6 +3675,20 @@ if active_batch:
                                 )
 
 
+                            if ocr_data.get("chassis_source") in (
+                                "barcode",
+                                "ocr+barcode",
+                            ):
+                                st.caption(
+                                    "🔵 Chassis No confirmed by "
+                                    "decoding the printed barcode."
+                                )
+                            elif ocr_data.get("chassis_source") == "master":
+                                st.caption(
+                                    "🟢 Chassis No matched to "
+                                    "master / mapping data."
+                                )
+
                             _barcode_source = (
                                 ocr_data.get(
                                     "barcode_source",
@@ -3563,9 +3712,8 @@ if active_batch:
                             ):
 
                                 st.caption(
-                                    "🟡 Barcode read from the "
-                                    "'BC No' text on the label. "
-                                    "Please double-check it."
+                                    "🟡 BC No read from the "
+                                    "printed 'BC No' text."
                                 )
 
                             else:
@@ -3577,75 +3725,62 @@ if active_batch:
                                 )
 
 
-                            _summary_rows = [
-                                (
-                                    "chassis_no",
-                                    ocr_data.get(
-                                        "chassis_no",
-                                        ""
-                                    )
-                                ),
-                                (
-                                    "vc_no",
-                                    ocr_data.get(
-                                        "vc_no",
-                                        ""
-                                    )
-                                ),
-                                (
-                                    "color",
-                                    ocr_data.get(
-                                        "color",
-                                        ""
-                                    )
-                                ),
-                                (
-                                    "order_no",
-                                    ocr_data.get(
-                                        "order_no",
-                                        ""
-                                    )
-                                ),
-                                (
-                                    "seating",
-                                    ocr_data.get(
-                                        "seating",
-                                        ""
-                                    )
-                                ),
-                                (
-                                    "barcode",
-                                    ocr_data.get(
-                                        "barcode",
-                                        ""
-                                    )
-                                ),
-                            ]
-
-                            _label_width = max(
-                                len(label)
-                                for label, _ in _summary_rows
+                            _conf = (
+                                ocr_data.get("confidence") or {}
                             )
-
-                            _summary_lines = [
-                                (
-                                    f"{label.ljust(_label_width)} : "
-                                    f"{value if value else '(not found)'}"
-                                )
-                                for label, value
-                                in _summary_rows
-                            ]
+                            _summary_table = pd.DataFrame(
+                                [
+                                    {
+                                        " ": _CONFIDENCE_ICON.get(
+                                            _conf.get(field, "check"),
+                                            "⚠️",
+                                        ),
+                                        "Field": label,
+                                        "Value": (
+                                            ocr_data.get(field, "")
+                                            or "(not found)"
+                                        ),
+                                    }
+                                    for field, label
+                                    in _FIELD_LABELS.items()
+                                ]
+                            )
 
                             st.markdown(
-                                "**📋 Extracted Fields Summary**"
+                                "**📋 Extracted Fields** "
+                                "(✅ confident · ⚠️ please check "
+                                "· ❌ not found)"
                             )
 
-                            st.code(
-                                "\n".join(
-                                    _summary_lines
-                                ),
-                                language=None
+                            st.dataframe(
+                                _summary_table,
+                                hide_index=True,
+                                use_container_width=True,
                             )
+
+                            for _note in (
+                                ocr_data.get("notes") or []
+                            ):
+                                st.caption(f"ℹ️ {_note}")
+
+                            _to_check = _fields_to_check(ocr_data)
+                            if _to_check:
+                                st.warning(
+                                    "Please verify before saving: "
+                                    + ", ".join(_to_check)
+                                )
+                            else:
+                                st.caption(
+                                    "All fields read with high "
+                                    "confidence."
+                                )
+
+                            try:
+                                st.caption(
+                                    f"OCR engine: {ocr_engine_name()}"
+                                )
+                            except Exception:
+                                pass
 
 
                             with st.expander(
